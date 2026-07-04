@@ -1,0 +1,127 @@
+cat > /root/restaurar-bind-unit-original.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Parando jobs e processos quebrados"
+systemctl cancel named.service 2>/dev/null || true
+systemctl cancel bind9.service 2>/dev/null || true
+
+timeout 8 systemctl stop named.service 2>/dev/null || true
+timeout 8 systemctl stop bind9.service 2>/dev/null || true
+
+pkill -TERM named 2>/dev/null || true
+sleep 2
+pkill -KILL named 2>/dev/null || true
+
+echo "==> Backup das units atuais"
+mkdir -p /root/nsguard-systemd-backup
+
+for F in \
+    /lib/systemd/system/named.service \
+    /lib/systemd/system/bind9.service \
+    /etc/systemd/system/named.service \
+    /etc/systemd/system/bind9.service
+do
+    if [ -e "$F" ]; then
+        cp -a "$F" "/root/nsguard-systemd-backup/$(basename "$F").bak.$(date +%Y%m%d-%H%M%S)" || true
+    fi
+done
+
+echo "==> Removendo overrides manuais em /etc/systemd/system"
+rm -f /etc/systemd/system/named.service
+rm -f /etc/systemd/system/bind9.service
+rm -rf /etc/systemd/system/named.service.d
+rm -rf /etc/systemd/system/bind9.service.d
+
+echo "==> Tentando restaurar unit original via reinstall do bind9"
+apt-get install --reinstall -y bind9 || true
+
+echo "==> Verificando se a unit ainda está falsa"
+if systemctl cat named.service 2>/dev/null | grep -qi "compatibility service for NSGuard"; then
+    echo "==> Reinstall não corrigiu. Recriando named.service manualmente."
+
+    cat > /lib/systemd/system/named.service <<'EOF'
+[Unit]
+Description=BIND Domain Name Server
+Documentation=man:named(8)
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/default/named
+ExecStart=/usr/sbin/named -f $OPTIONS
+ExecReload=/usr/sbin/rndc reload
+ExecStop=/usr/sbin/rndc stop
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+echo "==> Garantindo /etc/default/named"
+if [ ! -f /etc/default/named ]; then
+    cat > /etc/default/named <<'EOF'
+OPTIONS="-u bind"
+EOF
+elif ! grep -q '^OPTIONS=' /etc/default/named; then
+    echo 'OPTIONS="-u bind"' >> /etc/default/named
+fi
+
+echo "==> Removendo bind9.service falso, se existir"
+if [ -f /lib/systemd/system/bind9.service ] && grep -qi "compatibility service for NSGuard" /lib/systemd/system/bind9.service; then
+    rm -f /lib/systemd/system/bind9.service
+fi
+
+echo "==> Criando alias bind9.service -> named.service, se não existir"
+if [ ! -e /lib/systemd/system/bind9.service ]; then
+    ln -s named.service /lib/systemd/system/bind9.service
+fi
+
+echo "==> Recarregando systemd"
+systemctl daemon-reload
+systemctl reset-failed named.service bind9.service 2>/dev/null || true
+
+echo
+echo "==> Unit atual do named.service:"
+systemctl cat named.service
+
+echo
+if systemctl cat named.service | grep -qi "compatibility service for NSGuard"; then
+    echo "ERRO: named.service ainda está falso."
+    exit 1
+fi
+
+echo "==> Validando configuração do BIND"
+named-checkconf
+named-checkconf -z
+
+echo "==> Iniciando BIND"
+systemctl enable named.service
+systemctl restart named.service
+
+sleep 2
+
+echo
+echo "==> Status:"
+systemctl status named.service --no-pager -l || true
+
+echo
+echo "==> Porta 53:"
+ss -lntup | grep ':53' || true
+ss -lnuap | grep ':53' || true
+
+echo
+echo "==> Teste DNS"
+VM_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+[ -z "${VM_IP:-}" ] && VM_IP="$(hostname -I | awk '{print $1}')"
+
+echo "IP detectado: $VM_IP"
+
+dig @"$VM_IP" google.com +short +time=2 +tries=1 || true
+
+echo
+echo "OK. Unit do BIND restaurada."
+SH
+
+chmod +x /root/restaurar-bind-unit-original.sh
+bash /root/restaurar-bind-unit-original.sh
