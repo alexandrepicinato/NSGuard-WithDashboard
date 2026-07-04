@@ -1,0 +1,3 @@
+URL: http://IP-DA-VM:8087/admin/
+Email: admin@local
+Senha: admin123456
