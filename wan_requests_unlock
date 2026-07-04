@@ -1,0 +1,167 @@
+cat > /root/nsguard-fix-rpz-block.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Detectando IP da VM"
+VM_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+[ -z "${VM_IP:-}" ] && VM_IP="$(hostname -I | awk '{print $1}')"
+
+if [ -z "${VM_IP:-}" ]; then
+    echo "ERRO: não consegui detectar o IP da VM."
+    exit 1
+fi
+
+SERIAL="$(date +%s)"
+
+echo "IP detectado: $VM_IP"
+echo "Serial: $SERIAL"
+
+echo "==> Backup do BIND"
+mkdir -p /root/nsguard-bind-backup
+cp -a /etc/bind "/root/nsguard-bind-backup/bind-rpz-fix.$(date +%Y%m%d-%H%M%S)"
+
+echo "==> Criando zona local nsguard.local para página de bloqueio"
+
+cat > /etc/bind/db.nsguard.local <<EOF
+\$TTL 60
+@ IN SOA ns.nsguard.local. root.nsguard.local. (
+    ${SERIAL}
+    3600
+    600
+    604800
+    60
+)
+@       IN NS ns.nsguard.local.
+ns      IN A  ${VM_IP}
+block   IN A  ${VM_IP}
+@       IN A  ${VM_IP}
+EOF
+
+echo "==> Criando RPZ com domínio de teste bloqueado"
+
+cat > /etc/bind/db.rpz.nsguard <<EOF
+\$TTL 60
+@ IN SOA ns.rpz.nsguard. root.rpz.nsguard. (
+    ${SERIAL}
+    3600
+    600
+    604800
+    60
+)
+@ IN NS ns.rpz.nsguard.
+ns IN A ${VM_IP}
+
+; Domínio de teste
+malicioso.test.      CNAME block.nsguard.local.
+*.malicioso.test.    CNAME block.nsguard.local.
+EOF
+
+echo "==> Configurando zonas locais do NSGuard"
+
+cat > /etc/bind/named.conf.local <<'EOF'
+zone "nsguard.local" {
+    type master;
+    file "/etc/bind/db.nsguard.local";
+};
+
+zone "rpz.nsguard" {
+    type master;
+    file "/etc/bind/db.rpz.nsguard";
+    allow-query { none; };
+};
+EOF
+
+echo "==> Configurando named.conf.options com RPZ ativo"
+
+cat > /etc/bind/named.conf.options <<EOF
+options {
+    directory "/var/cache/bind";
+
+    listen-on port 53 {
+        any;
+    };
+
+    listen-on-v6 {
+        none;
+    };
+
+    allow-query {
+        any;
+    };
+
+    allow-query-cache {
+        any;
+    };
+
+    allow-recursion {
+        any;
+    };
+
+    recursion yes;
+
+    forward only;
+
+    forwarders {
+        1.1.1.1;
+        8.8.8.8;
+    };
+
+    dnssec-validation no;
+    auth-nxdomain no;
+
+    minimal-responses no;
+    edns-udp-size 1232;
+    max-udp-size 1232;
+
+    response-policy {
+        zone "rpz.nsguard";
+    } break-dnssec yes;
+};
+EOF
+
+echo "==> Garantindo named.conf principal"
+cat > /etc/bind/named.conf <<'EOF'
+include "/etc/bind/named.conf.options";
+include "/etc/bind/named.conf.local";
+include "/etc/bind/named.conf.default-zones";
+EOF
+
+echo "==> Permissões"
+chown -R root:bind /etc/bind
+find /etc/bind -type d -exec chmod 755 {} \;
+find /etc/bind -type f -exec chmod 644 {} \;
+
+echo "==> Validando BIND"
+named-checkconf
+named-checkconf -z
+
+echo "==> Reiniciando BIND"
+systemctl restart named.service
+
+sleep 2
+
+echo
+echo "==> Status"
+systemctl status named.service --no-pager -l || true
+
+echo
+echo "==> Teste google.com"
+dig @"${VM_IP}" google.com +short +time=2 +tries=1 || true
+
+echo
+echo "==> Teste bloqueio malicioso.test"
+dig @"${VM_IP}" malicioso.test A +short +time=2 +tries=1 || true
+
+echo
+echo "==> Teste bloqueio subdomínio"
+dig @"${VM_IP}" www.malicioso.test A +short +time=2 +tries=1 || true
+
+echo
+echo "OK."
+echo "O teste bloqueado deve retornar algo como:"
+echo "  block.nsguard.local."
+echo "  ${VM_IP}"
+SH
+
+chmod +x /root/nsguard-fix-rpz-block.sh
+bash /root/nsguard-fix-rpz-block.sh
